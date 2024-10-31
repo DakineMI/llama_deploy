@@ -6,12 +6,9 @@ from unittest.mock import patch, MagicMock, AsyncMock
 
 try:
     import aio_pika
-    from aio_pika import DeliveryMode, Message as AioPikaMessage, Exchange
+    from aio_pika import DeliveryMode, Message as AioPikaMessage
 except (ModuleNotFoundError, ImportError):
-    aio_pika = None
-    Exchange = Exchange
-    DeliveryMode = None
-    AioPikaMessage = None
+    aio_pika = None  # type: ignore
 
 
 def test_init() -> None:
@@ -70,9 +67,7 @@ async def test_publish(mock_connect: MagicMock) -> None:
     mq = RabbitMQMessageQueue()
     # mocks
     mock_exchange_publish = AsyncMock()
-    mock_connect.return_value.channel.return_value.declare_exchange.return_value.publish = (
-        mock_exchange_publish
-    )
+    mock_connect.return_value.channel.return_value.declare_exchange.return_value.publish = mock_exchange_publish
     # message types
     queue_message = QueueMessage(publisher_id="test", id_="1")
     message_body = json.dumps(queue_message.model_dump()).encode("utf-8")

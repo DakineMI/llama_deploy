@@ -1,13 +1,16 @@
+import asyncio
 import json
 import uuid
+from logging import getLogger
+from typing import Any, AsyncGenerator, Dict, List, Optional
+
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from logging import getLogger
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Dict, List, Optional
-
-from llama_index.core.storage.kvstore.types import BaseKVStore
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from llama_index.core.storage.kvstore import SimpleKVStore
+from llama_index.core.storage.kvstore.types import BaseKVStore
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from llama_deploy.control_plane.base import BaseControlPlane
 from llama_deploy.message_consumers.base import (
@@ -19,13 +22,15 @@ from llama_deploy.message_consumers.remote import RemoteMessageConsumer
 from llama_deploy.message_queues.base import BaseMessageQueue, PublishCallback
 from llama_deploy.messages.base import QueueMessage
 from llama_deploy.orchestrators.base import BaseOrchestrator
-from llama_deploy.orchestrators.utils import get_result_key
+from llama_deploy.orchestrators.utils import get_result_key, get_stream_key
 from llama_deploy.types import (
     ActionTypes,
-    SessionDefinition,
+    EventDefinition,
     ServiceDefinition,
+    SessionDefinition,
     TaskDefinition,
     TaskResult,
+    TaskStream,
 )
 
 logger = getLogger(__name__)
@@ -48,6 +53,7 @@ class ControlPlaneConfig(BaseSettings):
     internal_host: Optional[str] = None
     internal_port: Optional[int] = None
     running: bool = True
+    cors_origins: Optional[List[str]] = None
 
     @property
     def url(self) -> str:
@@ -80,6 +86,7 @@ class ControlPlaneServer(BaseControlPlane):
         internal_host (Optional[str], optional): The host for external networking as in Docker-Compose or K8s.
         internal_port (Optional[int], optional): The port for external networking as in Docker-Compose or K8s.
         running (bool, optional): Whether the service is running. Defaults to True.
+        cors_origins (Optional[List[str]], optional): List of hosts from which the service will accept CORS requests.  Use '["*"]' for all hosts.
 
     Examples:
         ```python
@@ -105,10 +112,11 @@ class ControlPlaneServer(BaseControlPlane):
         session_store_key: str = "sessions",
         step_interval: float = 0.1,
         host: str = "127.0.0.1",
-        port: Optional[int] = 8000,
+        port: int = 8000,
         internal_host: Optional[str] = None,
         internal_port: Optional[int] = None,
         running: bool = True,
+        cors_origins: Optional[List[str]] = None,
     ) -> None:
         self.orchestrator = orchestrator
 
@@ -130,6 +138,13 @@ class ControlPlaneServer(BaseControlPlane):
         self._publish_callback = publish_callback
 
         self.app = FastAPI()
+        if cors_origins:
+            self.app.add_middleware(
+                CORSMiddleware,
+                allow_origins=cors_origins,
+                allow_methods=["*"],
+                allow_headers=["*"],
+            )
         self.app.add_api_route("/", self.home, methods=["GET"], tags=["Control Plane"])
         self.app.add_api_route(
             "/process_message",
@@ -217,6 +232,30 @@ class ControlPlaneServer(BaseControlPlane):
             methods=["GET"],
             tags=["Sessions"],
         )
+        self.app.add_api_route(
+            "/sessions/{session_id}/tasks/{task_id}/result_stream",
+            self.get_task_result_stream,
+            methods=["GET"],
+            tags=["Sessions"],
+        )
+        self.app.add_api_route(
+            "/sessions/{session_id}/tasks/{task_id}/send_event",
+            self.send_event,
+            methods=["POST"],
+            tags=["Sessions"],
+        )
+        self.app.add_api_route(
+            "/sessions/{session_id}/state",
+            self.get_session_state,
+            methods=["GET"],
+            tags=["Sessions"],
+        )
+        self.app.add_api_route(
+            "/sessions/{session_id}/state",
+            self.update_session_state,
+            methods=["POST"],
+            tags=["Sessions"],
+        )
 
     @property
     def message_queue(self) -> BaseMessageQueue:
@@ -241,6 +280,8 @@ class ControlPlaneServer(BaseControlPlane):
             await self.add_task_to_session(task_def.session_id, task_def)
         elif action == ActionTypes.COMPLETED_TASK and message.data is not None:
             await self.handle_service_completion(TaskResult(**message.data))
+        elif action == ActionTypes.TASK_STREAM and message.data is not None:
+            await self.add_stream_to_session(TaskStream(**message.data))
         else:
             raise ValueError(f"Action {action} not supported by control plane")
 
@@ -332,7 +373,7 @@ class ControlPlaneServer(BaseControlPlane):
         if session_dict is None:
             raise HTTPException(status_code=404, detail="Session not found")
 
-        return SessionDefinition(**session_dict)
+        return SessionDefinition.model_validate(session_dict)
 
     async def delete_session(self, session_id: str) -> None:
         await self.state_store.adelete(session_id, collection=self.session_store_key)
@@ -343,7 +384,7 @@ class ControlPlaneServer(BaseControlPlane):
         )
 
         return {
-            session_id: SessionDefinition(**session_dict)
+            session_id: SessionDefinition.model_validate(session_dict)
             for session_id, session_dict in session_dicts.items()
         }
 
@@ -368,6 +409,9 @@ class ControlPlaneServer(BaseControlPlane):
         )
         if session_dict is None:
             raise HTTPException(status_code=404, detail="Session not found")
+
+        if not task_def.session_id:
+            task_def.session_id = session_id
 
         session = SessionDefinition(**session_dict)
         session.task_ids.append(task_def.task_id)
@@ -426,7 +470,7 @@ class ControlPlaneServer(BaseControlPlane):
             collection=self.session_store_key,
         )
 
-        # generate and send new tasks (if any)
+        # generate and send new tasks when needed
         task_def = await self.send_task_to_service(task_def)
 
         await self.state_store.aput(
@@ -478,6 +522,111 @@ class ControlPlaneServer(BaseControlPlane):
 
         return result
 
+    async def add_stream_to_session(self, task_stream: TaskStream) -> None:
+        # get session
+        if task_stream.session_id is None:
+            raise ValueError(
+                f"Task stream with id {task_stream.task_id} has no session"
+            )
+
+        session = await self.get_session(task_stream.session_id)
+
+        # add new stream data to session state
+        existing_stream = session.state.get(get_stream_key(task_stream.task_id), [])
+        existing_stream.append(task_stream.model_dump())
+        session.state[get_stream_key(task_stream.task_id)] = existing_stream
+
+        # update session state in store
+        await self.state_store.aput(
+            task_stream.session_id,
+            session.model_dump(),
+            collection=self.session_store_key,
+        )
+
+    async def get_task_result_stream(
+        self, session_id: str, task_id: str
+    ) -> StreamingResponse:
+        session = await self.get_session(session_id)
+
+        stream_key = get_stream_key(task_id)
+        if stream_key not in session.state:
+            raise HTTPException(status_code=404, detail="Task stream not found")
+
+        async def event_generator(
+            session: SessionDefinition, stream_key: str
+        ) -> AsyncGenerator[str, None]:
+            try:
+                last_index = 0
+                while True:
+                    session = await self.get_session(session_id)
+                    stream_results = session.state[stream_key][last_index:]
+                    stream_results = sorted(stream_results, key=lambda x: x["index"])
+                    for result in stream_results:
+                        if not isinstance(result, TaskStream):
+                            if isinstance(result, dict):
+                                result = TaskStream(**result)
+                            elif isinstance(result, str):
+                                result = TaskStream(**json.loads(result))
+                            else:
+                                raise ValueError("Unexpected result type in stream")
+
+                        yield json.dumps(result.data) + "\n"
+
+                    # check if there is a final result
+                    final_result = await self.get_task_result(task_id, session_id)
+                    if final_result is not None:
+                        return
+
+                    last_index += len(stream_results)
+                    # Small delay to prevent tight loop
+                    await asyncio.sleep(self.step_interval)
+            except Exception as e:
+                logger.error(
+                    f"Error in event stream for session {session_id}, task {task_id}: {str(e)}"
+                )
+                yield json.dumps({"error": str(e)}) + "\n"
+
+        return StreamingResponse(
+            event_generator(session, stream_key),
+            media_type="application/x-ndjson",
+        )
+
+    async def send_event(
+        self,
+        session_id: str,
+        task_id: str,
+        event_def: EventDefinition,
+    ) -> None:
+        task_def = TaskDefinition(
+            task_id=task_id,
+            session_id=session_id,
+            input=event_def.event_obj_str,
+            agent_id=event_def.agent_id,
+        )
+        message = QueueMessage(
+            type=event_def.agent_id,
+            action=ActionTypes.SEND_EVENT,
+            data=task_def.model_dump(),
+        )
+        await self.publish(message)
+
+    async def get_session_state(self, session_id: str) -> Dict[str, Any]:
+        session = await self.get_session(session_id)
+        if session.task_ids is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        return session.state
+
+    async def update_session_state(
+        self, session_id: str, state: Dict[str, Any]
+    ) -> None:
+        session = await self.get_session(session_id)
+
+        session.state.update(state)
+        await self.state_store.aput(
+            session_id, session.model_dump(), collection=self.session_store_key
+        )
+
     async def get_message_queue_config(self) -> Dict[str, dict]:
         """
         Gets the config dict for the message queue being used.
@@ -493,7 +642,6 @@ class ControlPlaneServer(BaseControlPlane):
 
 
 if __name__ == "__main__":
-    import asyncio
     from llama_deploy import SimpleMessageQueue, SimpleOrchestrator
 
     control_plane = ControlPlaneServer(SimpleMessageQueue(), SimpleOrchestrator())

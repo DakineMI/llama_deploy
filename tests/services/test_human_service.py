@@ -1,19 +1,20 @@
 import asyncio
-import pytest
-from pydantic import PrivateAttr, ValidationError
 from typing import Any, List
 from unittest.mock import MagicMock, patch
+
+import pytest
+from pydantic import PrivateAttr, ValidationError
+
+from llama_deploy.message_consumers.base import BaseMessageQueueConsumer
+from llama_deploy.message_queues.simple import SimpleMessageQueue
+from llama_deploy.messages.base import QueueMessage
 from llama_deploy.services import HumanService
 from llama_deploy.services.human import HELP_REQUEST_TEMPLATE_STR
-from llama_deploy.message_queues.simple import SimpleMessageQueue
-from llama_deploy.message_consumers.base import BaseMessageQueueConsumer
-from llama_deploy.messages.base import QueueMessage
 from llama_deploy.types import (
-    NewTask,
-    TaskDefinition,
-    ActionTypes,
     CONTROL_PLANE_NAME,
+    ActionTypes,
     ChatMessage,
+    TaskDefinition,
 )
 
 
@@ -41,6 +42,8 @@ async def test_init() -> None:
         description="Test Human Service",
         service_name="Test Human Service",
         step_interval=0.5,
+        host="localhost",
+        port=8001,
     )
 
     # assert
@@ -53,7 +56,9 @@ async def test_init() -> None:
 def test_invalid_human_prompt_raises_validation_error() -> None:
     # arrange
     invalid_human_prompt_input_str = "{incorrect_param}"
-    human_service = HumanService(message_queue=SimpleMessageQueue())
+    human_service = HumanService(
+        message_queue=SimpleMessageQueue(), host="localhost", port=8001
+    )
 
     # act/assert
     with pytest.raises(ValidationError):
@@ -68,7 +73,7 @@ def test_invalid_human_prompt_raises_validation_error() -> None:
 
 
 @pytest.mark.asyncio()
-@patch("llama_deploy.types.uuid")
+@patch("llama_deploy.types.core.uuid")
 async def test_create_task(mock_uuid: MagicMock) -> None:
     # arrange
     human_service = HumanService(
@@ -77,6 +82,8 @@ async def test_create_task(mock_uuid: MagicMock) -> None:
         description="Test Human Service",
         service_name="Test Human Service",
         step_interval=0.5,
+        host="localhost",
+        port=8001,
     )
     mock_uuid.uuid4.return_value = "mock_id"
     task = TaskDefinition(task_id="1", input="Mock human req.")
@@ -98,6 +105,8 @@ async def test_process_task(
     mq = SimpleMessageQueue()
     human_service = HumanService(
         message_queue=mq,
+        host="localhost",
+        port=8001,
     )
     await mq.register_consumer(human_output_consumer)
 
@@ -136,7 +145,9 @@ async def test_process_human_req_from_queue(
 ) -> None:
     # arrange
     mq = SimpleMessageQueue()
-    human_service = HumanService(message_queue=mq, service_name="test_human_service")
+    human_service = HumanService(
+        message_queue=mq, service_name="test_human_service", host="localhost", port=8001
+    )
     await mq.register_consumer(human_output_consumer)
     await mq.register_consumer(human_service.as_consumer())
 
@@ -147,7 +158,7 @@ async def test_process_human_req_from_queue(
     # act
     req = TaskDefinition(task_id="1", input="Mock human req.")
     human_req_message = QueueMessage(
-        data=NewTask(task=req).model_dump(),
+        data=req.model_dump(),
         action=ActionTypes.NEW_TASK,
         type="test_human_service",
     )
@@ -183,6 +194,8 @@ async def test_process_task_with_custom_human_input_fn(
         message_queue=mq,
         fn_input=my_custom_human_input_fn,
         human_input_prompt="{input_str}",
+        host="localhost",
+        port=8001,
     )
     await mq.register_consumer(human_output_consumer)
 
@@ -216,7 +229,12 @@ async def test_process_task_as_tool_call(
 ) -> None:
     # arrange
     mq = SimpleMessageQueue()
-    human_service = HumanService(message_queue=mq, service_name="test_human_service")
+    human_service = HumanService(
+        message_queue=mq,
+        service_name="test_human_service",
+        host="localhost",
+        port=8001,
+    )
     output_consumer = MockMessageConsumer(message_type="tool_call_source")
     await mq.register_consumer(output_consumer)
     await mq.register_consumer(human_service.as_consumer())

@@ -4,15 +4,15 @@ import asyncio
 import httpx
 import random
 import uvicorn
-
 from collections import deque
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, status
 from logging import getLogger
+from typing import Any, AsyncGenerator, Dict, List, Optional, Literal, Sequence
+from urllib.parse import urljoin
+
+from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field, PrivateAttr
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Any, AsyncGenerator, Dict, List, Optional
-from urllib.parse import urljoin
 
 from llama_deploy.message_queues.base import BaseMessageQueue
 from llama_deploy.messages.base import QueueMessage
@@ -35,6 +35,7 @@ class SimpleMessageQueueConfig(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="SIMPLE_MESSAGE_QUEUE_")
 
+    type: Literal["simple"] = Field(default="simple", exclude=True)
     host: str = "127.0.0.1"
     port: Optional[int] = 8001
     internal_host: Optional[str] = None
@@ -105,7 +106,7 @@ class SimpleRemoteClientMessageQueue(BaseMessageQueue):
 
     async def get_consumers(
         self, message_type: str, get_consumers_url: str = "get_consumers"
-    ) -> List[BaseMessageQueueConsumer]:
+    ) -> Sequence[BaseMessageQueueConsumer]:
         client_kwargs = self.client_kwargs or {}
         url = urljoin(self.base_url, f"{get_consumers_url}/{message_type}")
         async with httpx.AsyncClient(**client_kwargs) as client:
@@ -137,7 +138,7 @@ class SimpleRemoteClientMessageQueue(BaseMessageQueue):
             "`cleanup_local()` is not implemented for this class."
         )
 
-    def as_config(self) -> Dict[str, dict]:
+    def as_config(self) -> SimpleMessageQueueConfig:
         return SimpleMessageQueueConfig(host=self.host, port=self.port)
 
 
@@ -174,7 +175,7 @@ class SimpleMessageQueue(BaseMessageQueue):
     )
     queues: Dict[str, deque] = Field(default_factory=dict)
     running: bool = True
-    port: Optional[int] = 8001
+    port: int = 8001
     host: str = "127.0.0.1"
     internal_host: Optional[str] = None
     internal_port: Optional[int] = None

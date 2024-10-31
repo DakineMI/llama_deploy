@@ -1,10 +1,9 @@
 import asyncio
-import base64
 import json
-import pickle
 import os
 import uuid
 import uvicorn
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from logging import getLogger
@@ -12,7 +11,12 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import AsyncGenerator, Dict, Optional, Any
 
-from llama_index.core.workflow import Workflow
+from llama_index.core.workflow import Context, Workflow
+from llama_index.core.workflow.handler import WorkflowHandler
+from llama_index.core.workflow.context_serializers import (
+    JsonPickleSerializer,
+    JsonSerializer,
+)
 
 from llama_deploy.message_consumers.base import BaseMessageQueueConsumer
 from llama_deploy.message_consumers.callable import CallableMessageConsumer
@@ -23,8 +27,9 @@ from llama_deploy.messages.base import QueueMessage
 from llama_deploy.services.base import BaseService
 from llama_deploy.types import (
     ActionTypes,
-    NewTask,
     TaskResult,
+    TaskStream,
+    TaskDefinition,
     ServiceDefinition,
     CONTROL_PLANE_NAME,
 )
@@ -63,10 +68,16 @@ class WorkflowState(BaseModel):
     hash: Optional[int] = Field(
         default=None, description="Hash of the context, if any."
     )
-    state: Optional[str] = Field(default=None, description="Pickled state, if any.")
+    state: Optional[dict] = Field(
+        default_factory=dict, description="Pickled state, if any."
+    )
     run_kwargs: Dict[str, Any] = Field(
         default_factory=dict, description="Run kwargs needed to run the workflow."
     )
+    session_id: Optional[str] = Field(
+        default=None, description="Session ID for the current task."
+    )
+    task_id: str = Field(description="Task ID for the current run.")
 
 
 class WorkflowService(BaseService):
@@ -109,8 +120,8 @@ class WorkflowService(BaseService):
     running: bool = True
     step_interval: float = 0.1
     max_concurrent_tasks: int = 8
-    host: Optional[str] = None
-    port: Optional[int] = None
+    host: str
+    port: int
     internal_host: Optional[str] = None
     internal_port: Optional[int] = None
     raise_exceptions: bool = False
@@ -121,6 +132,7 @@ class WorkflowService(BaseService):
     _publish_callback: Optional[PublishCallback] = PrivateAttr()
     _lock: asyncio.Lock = PrivateAttr()
     _outstanding_calls: Dict[str, WorkflowState] = PrivateAttr()
+    _events_buffer: Dict[str, asyncio.Queue] = PrivateAttr()
 
     def __init__(
         self,
@@ -159,6 +171,7 @@ class WorkflowService(BaseService):
 
         self._outstanding_calls: Dict[str, WorkflowState] = {}
         self._ongoing_tasks: Dict[str, asyncio.Task] = {}
+        self._events_buffer: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
 
         self._app = FastAPI(lifespan=self.lifespan)
 
@@ -202,80 +215,145 @@ class WorkflowService(BaseService):
     def lock(self) -> asyncio.Lock:
         return self._lock
 
-    def load_workflow_state(self, workflow: Workflow, state: WorkflowState) -> Workflow:
-        """Fork the workflow with the given state.
+    async def get_workflow_state(self, state: WorkflowState) -> Optional[Context]:
+        """Load the existing context from the workflow state.
 
-        TODO: Support managing the workflow state.
+        TODO: Support managing the workflow state?
         """
-        context_hash = state.hash
-        context_str = state.state
-        if not context_str:
-            return workflow
+        if state.session_id is None:
+            return None
 
-        if hash(context_str + hash_secret) != context_hash:
-            raise ValueError("Context hash does not match. Possible data corruption.")
+        state_dict = await self.get_session_state(state.session_id)
+        if state_dict is None:
+            return None
 
-        # only load context once it's been verified(?)
+        workflow_state_json = state_dict.get(state.session_id, None)
 
-        return workflow
+        if workflow_state_json is None:
+            return None
 
-    def dump_workflow_state(
-        self, workflow: Workflow, run_kawrgs: dict
-    ) -> WorkflowState:
-        """Dump the workflow state.
+        workflow_state = WorkflowState.model_validate_json(workflow_state_json)
+        if workflow_state.state is None:
+            return None
 
-        TODO: Support managing the workflow state.
-        """
-        context_bytes = pickle.dumps({})
-        context_str = base64.b64encode(context_bytes).decode("ascii")
+        context_dict = workflow_state.state
+        context_str = json.dumps(context_dict)
         context_hash = hash(context_str + hash_secret)
 
-        return WorkflowState(
-            hash=context_hash, state=context_str, run_kwargs=run_kawrgs
+        if workflow_state.hash is not None and context_hash != workflow_state.hash:
+            raise ValueError("Context hash does not match!")
+
+        return Context.from_dict(
+            self.workflow,
+            workflow_state.state,
+            serializer=JsonPickleSerializer(),
         )
 
-    async def process_call(self, task_id: str, current_call: WorkflowState) -> None:
+    async def set_workflow_state(
+        self, ctx: Context, current_state: WorkflowState
+    ) -> None:
+        """Set the workflow state for this session."""
+        context_dict = ctx.to_dict(serializer=JsonPickleSerializer())
+        context_str = json.dumps(context_dict)
+        context_hash = hash(context_str + hash_secret)
+
+        workflow_state = WorkflowState(
+            hash=context_hash,
+            state=context_dict,
+            run_kwargs=current_state.run_kwargs,
+            session_id=current_state.session_id,
+            task_id=current_state.task_id,
+        )
+
+        if current_state.session_id is None:
+            raise ValueError("Session ID is None! Cannot set workflow state.")
+
+        session_state = await self.get_session_state(current_state.session_id)
+        if session_state:
+            session_state[current_state.session_id] = workflow_state.model_dump_json()
+
+            # Store the state in the control plane
+            await self.update_session_state(current_state.session_id, session_state)
+
+    async def process_call(self, current_call: WorkflowState) -> None:
         """Processes a given task, and writes a response to the message queue.
 
         Handles errors with a generic try/except, and publishes the error message
         as the result.
 
         Args:
-            task_id (str):
-                The task ID being processed
             current_call (WorkflowState):
                 The state of the current task, including run_kwargs and other session state.
         """
         try:
             # load the state
-            self.load_workflow_state(self.workflow, current_call)
+            ctx = await self.get_workflow_state(current_call)
 
             # run the workflow
-            result = await self.workflow.run(**current_call.run_kwargs)
+            handler = self.workflow.run(ctx=ctx, **current_call.run_kwargs)
 
-            # dump the state
-            updated_state = self.dump_workflow_state(
-                self.workflow, current_call.run_kwargs
-            )
+            # create send_event background task
+            close_send_events = asyncio.Event()
 
+            async def send_events(
+                handler: WorkflowHandler, close_event: asyncio.Event
+            ) -> None:
+                if handler.ctx is None:
+                    raise ValueError("handler does not have a valid Context.")
+
+                while not close_event.is_set():
+                    try:
+                        event = self._events_buffer[current_call.task_id].get_nowait()
+                        handler.ctx.send_event(event)
+                    except asyncio.QueueEmpty:
+                        pass
+                    await asyncio.sleep(self.step_interval)
+
+            _ = asyncio.create_task(send_events(handler, close_send_events))
+
+            index = 0
+            async for ev in handler.stream_events():
+                # send the event to control plane for client / api server streaming
+                logger.debug(f"Publishing event: {ev}")
+                await self.message_queue.publish(
+                    QueueMessage(
+                        type=CONTROL_PLANE_NAME,
+                        action=ActionTypes.TASK_STREAM,
+                        data=TaskStream(
+                            task_id=current_call.task_id,
+                            session_id=current_call.session_id,
+                            data=ev.model_dump(),
+                            index=index,
+                        ).model_dump(),
+                    )
+                )
+                index += 1
+
+            final_result = await handler
+
+            # dump the state # dump the state
+            await self.set_workflow_state(handler.ctx, current_call)
+
+            logger.debug(f"Publishing final result: {final_result}")
             await self.message_queue.publish(
                 QueueMessage(
                     type=CONTROL_PLANE_NAME,
                     action=ActionTypes.COMPLETED_TASK,
                     data=TaskResult(
-                        task_id=task_id,
+                        task_id=current_call.task_id,
                         history=[],
-                        result=str(result),
-                        data=updated_state.dict(),
+                        result=str(final_result),
+                        data={},
                     ).model_dump(),
                 )
             )
         except Exception as e:
-            logger.error(f"Encountered error in task {task_id}! {str(e)}")
+            if self.raise_exceptions:
+                raise e
+
+            logger.error(f"Encountered error in task {current_call.task_id}! {str(e)}")
             # dump the state
-            updated_state = self.dump_workflow_state(
-                self.workflow, current_call.run_kwargs
-            )
+            await self.set_workflow_state(handler.ctx, current_call)
 
             # return failure
             await self.message_queue.publish(
@@ -283,18 +361,19 @@ class WorkflowService(BaseService):
                     type=CONTROL_PLANE_NAME,
                     action=ActionTypes.COMPLETED_TASK,
                     data=TaskResult(
-                        task_id=task_id,
+                        task_id=current_call.task_id,
                         history=[],
                         result=str(e),
-                        data=updated_state.dict(),
+                        data={},
                     ).model_dump(),
                 )
             )
         finally:
             # clean up
+            close_send_events.set()
             async with self.lock:
-                self._outstanding_calls.pop(task_id, None)
-            self._ongoing_tasks.pop(task_id, None)
+                self._outstanding_calls.pop(current_call.task_id, None)
+            self._ongoing_tasks.pop(current_call.task_id, None)
 
     async def manage_tasks(self) -> None:
         """Acts as a manager to process outstanding tasks from a queue.
@@ -328,7 +407,7 @@ class WorkflowService(BaseService):
             for task_id, current_call in new_calls:
                 if len(self._ongoing_tasks) >= self.max_concurrent_tasks:
                     break
-                task = asyncio.create_task(self.process_call(task_id, current_call))
+                task = asyncio.create_task(self.process_call(current_call))
                 self._ongoing_tasks[task_id] = task
 
             await asyncio.sleep(0.1)  # Small sleep to prevent busy-waiting
@@ -353,13 +432,25 @@ class WorkflowService(BaseService):
     async def process_message(self, message: QueueMessage) -> None:
         """Process a message received from the message queue."""
         if message.action == ActionTypes.NEW_TASK:
-            new_task = NewTask(**message.data or {})
+            task_def = TaskDefinition(**message.data or {})
+
+            run_kwargs = json.loads(task_def.input)
+            workflow_state = WorkflowState(
+                session_id=task_def.session_id,
+                task_id=task_def.task_id,
+                run_kwargs=run_kwargs,
+            )
+
             async with self.lock:
-                new_task.state["run_kwargs"] = json.loads(new_task.task.input)
-                workflow_state = WorkflowState(
-                    **new_task.state,
-                )
-                self._outstanding_calls[new_task.task.task_id] = workflow_state
+                self._outstanding_calls[task_def.task_id] = workflow_state
+        elif message.action == ActionTypes.SEND_EVENT:
+            serializer = JsonSerializer()
+
+            task_def = TaskDefinition(**message.data or {})
+            event = serializer.deserialize(task_def.input)
+            async with self.lock:
+                self._events_buffer[task_def.task_id].put_nowait(event)
+
         else:
             raise ValueError(f"Unhandled action: {message.action}")
 

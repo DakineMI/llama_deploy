@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from logging import getLogger
 from pydantic import PrivateAttr
-from typing import AsyncGenerator, Dict, List, Literal, Optional
+from typing import AsyncGenerator, Dict, List, Literal, Optional, cast
 
 from llama_index.core.agent import AgentRunner
 
@@ -21,7 +21,6 @@ from llama_deploy.types import (
     ActionTypes,
     ChatMessage,
     MessageRole,
-    NewTask,
     TaskResult,
     TaskDefinition,
     ToolCall,
@@ -102,8 +101,8 @@ class AgentService(BaseService):
     prompt: Optional[List[ChatMessage]] = None
     running: bool = True
     step_interval: float = 0.1
-    host: Optional[str] = None
-    port: Optional[int] = None
+    host: str
+    port: int
     raise_exceptions: bool = False
 
     _message_queue: BaseMessageQueue = PrivateAttr()
@@ -117,14 +116,14 @@ class AgentService(BaseService):
         self,
         agent: AgentRunner,
         message_queue: BaseMessageQueue,
+        host: str,
+        port: int,
         running: bool = True,
         description: str = "Agent Server",
         service_name: str = "default_agent",
         prompt: Optional[List[ChatMessage]] = None,
         publish_callback: Optional[PublishCallback] = None,
         step_interval: float = 0.1,
-        host: Optional[str] = None,
-        port: Optional[int] = None,
         raise_exceptions: bool = False,
     ) -> None:
         super().__init__(
@@ -310,8 +309,7 @@ class AgentService(BaseService):
     async def process_message(self, message: QueueMessage) -> None:
         """Handling for when a message is received."""
         if message.action == ActionTypes.NEW_TASK:
-            new_task = NewTask(**message.data or {})
-            task_def = new_task.task
+            task_def = TaskDefinition(**message.data or {})
             self.agent.create_task(task_def.input, task_id=task_def.task_id)
             logger.info(f"Created new task: {task_def.task_id}")
         elif message.action == ActionTypes.NEW_TOOL_CALL:
@@ -319,7 +317,7 @@ class AgentService(BaseService):
             async with self.lock:
                 tool_call_bundle = ToolCallBundle(
                     tool_name=self.tool_name,
-                    tool_args=(),
+                    tool_args=[],
                     tool_kwargs={"input": task_def.input},
                 )
                 task_as_tool_call = ToolCall(
@@ -400,16 +398,21 @@ class AgentService(BaseService):
             "tasks": complete_task_string,
         }
 
-    async def create_task(self, task: TaskDefinition) -> Dict[str, str]:
+    async def create_task(self, task_definition: TaskDefinition) -> Dict[str, str]:
         """Create a task."""
-        task_id = self.agent.create_task(task, task_id=task.task_id)
-        return {"task_id": task_id}
+        task = self.agent.create_task(
+            task_definition.input, task_id=task_definition.task_id
+        )
+        return {"task_id": task.task_id}
 
     async def get_messages(self) -> List[_ChatMessage]:
         """Get messages from the agent."""
         messages = self.agent.chat_history
 
-        return [_ChatMessage.from_chat_message(message) for message in messages]
+        return [
+            _ChatMessage.from_chat_message(cast(ChatMessage, message))
+            for message in messages
+        ]
 
     async def toggle_agent_running(
         self, state: Literal["running", "stopped"]

@@ -3,9 +3,11 @@
 import asyncio
 import json
 from logging import getLogger
-from pydantic import BaseModel
+from typing import Any, Dict, List, Optional, TYPE_CHECKING, Literal, cast
+
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
 from llama_deploy.message_queues.base import (
     BaseMessageQueue,
 )
@@ -16,7 +18,8 @@ from llama_deploy.message_consumers.base import (
 )
 
 if TYPE_CHECKING:
-    from aio_pika import Connection, Queue
+    from aio_pika import Connection, Queue, Channel, IncomingMessage
+    from aio_pika.abc import AbstractIncomingMessage
 
 logger = getLogger(__name__)
 
@@ -30,6 +33,7 @@ class RabbitMQMessageQueueConfig(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="RABBITMQ_")
 
+    type: Literal["rabbitmq"] = Field(default="rabbitmq", exclude=True)
     url: str = DEFAULT_URL
     exchange_name: str = DEFAULT_EXCHANGE_NAME
     username: Optional[str] = None
@@ -56,7 +60,7 @@ async def _establish_connection(url: str) -> "Connection":
         raise ValueError(
             "Missing pika optional dep. Please install by running `pip install llama-deploy[rabbimq]`."
         )
-    return await aio_pika.connect(url)
+    return cast(Connection, await aio_pika.connect(url))
 
 
 class RabbitMQMessageQueue(BaseMessageQueue):
@@ -67,14 +71,16 @@ class RabbitMQMessageQueue(BaseMessageQueue):
         1. https://aio-pika.readthedocs.io/en/latest/rabbitmq-tutorial/2-work-queues.html
         2. https://aio-pika.readthedocs.io/en/latest/rabbitmq-tutorial/3-publish-subscribe.html
 
-    Connections are established by url that use amqp uri scheme
-    (https://www.rabbitmq.com/docs/uri-spec#the-amqp-uri-scheme)
-        amqp_URI       = "amqp://" amqp_authority [ "/" vhost ] [ "?" query ]
-        amqp_authority = [ amqp_userinfo "@" ] host [ ":" port ]
-        amqp_userinfo  = username [ ":" password ]
-        username       = *( unreserved / pct-encoded / sub-delims )
-        password       = *( unreserved / pct-encoded / sub-delims )
-        vhost          = segment
+    Connections are established by url that use [amqp uri scheme](https://www.rabbitmq.com/docs/uri-spec#the-amqp-uri-scheme):
+
+    ```
+    amqp_URI       = "amqp://" amqp_authority [ "/" vhost ] [ "?" query ]
+    amqp_authority = [ amqp_userinfo "@" ] host [ ":" port ]
+    amqp_userinfo  = username [ ":" password ]
+    username       = *( unreserved / pct-encoded / sub-delims )
+    password       = *( unreserved / pct-encoded / sub-delims )
+    vhost          = segment
+    ```
 
     The Work Queue created has the following properties:
         - Exchange with name self.exchange
@@ -175,16 +181,16 @@ class RabbitMQMessageQueue(BaseMessageQueue):
         self, consumer: BaseMessageQueueConsumer
     ) -> StartConsumingCallable:
         """Register a new consumer."""
-        from aio_pika import ExchangeType, Message as AioPikaMessage
+        from aio_pika import ExchangeType
 
         connection = await _establish_connection(self.url)
         async with connection:
-            channel = await connection.channel()
+            channel = cast(Channel, await connection.channel())
             exchange = await channel.declare_exchange(
                 self.exchange_name,
                 ExchangeType.DIRECT,
             )
-            queue: Queue = await channel.declare_queue(name=consumer.message_type)
+            queue = cast(Queue, await channel.declare_queue(name=consumer.message_type))
             await queue.bind(exchange)
 
         logger.info(
@@ -197,7 +203,8 @@ class RabbitMQMessageQueue(BaseMessageQueue):
             Consumer of this queue, should call this in order to start consuming.
             """
 
-            async def on_message(message: AioPikaMessage) -> None:
+            async def on_message(message: AbstractIncomingMessage) -> None:
+                message = cast(IncomingMessage, message)
                 async with message.process():
                     decoded_message = json.loads(message.body.decode("utf-8"))
                     queue_message = QueueMessage.model_validate(decoded_message)
@@ -210,7 +217,9 @@ class RabbitMQMessageQueue(BaseMessageQueue):
                     self.exchange_name,
                     ExchangeType.DIRECT,
                 )
-                queue: Queue = await channel.declare_queue(name=consumer.message_type)
+                queue = cast(
+                    Queue, await channel.declare_queue(name=consumer.message_type)
+                )
                 await queue.bind(exchange)
 
                 await queue.consume(on_message)
