@@ -2,6 +2,7 @@ from unittest import mock
 
 import httpx
 import pytest
+from llama_index.core.workflow import Event
 
 from llama_deploy.client.models.core import (
     Core,
@@ -28,7 +29,7 @@ async def test_session_run(client: mock.AsyncMock) -> None:
         ),
     ]
 
-    session = Session.instance(client=client, id="test_session_id")
+    session = Session(client=client, id="test_session_id")
     result = await session.run("test_service", test_param="test_value")
 
     assert result == "test result"
@@ -38,7 +39,7 @@ async def test_session_run(client: mock.AsyncMock) -> None:
 async def test_session_create_task(client: mock.AsyncMock) -> None:
     client.request.return_value = mock.MagicMock(json=lambda: "test_task_id")
 
-    session = Session.instance(client=client, id="test_session_id")
+    session = Session(client=client, id="test_session_id")
     task_def = TaskDefinition(input="test input", agent_id="test_service")
     task_id = await session.create_task(task_def)
 
@@ -51,7 +52,7 @@ async def test_session_get_task_result(client: mock.AsyncMock) -> None:
         json=lambda: {"task_id": "test_task_id", "result": "test_result", "history": []}
     )
 
-    session = Session.instance(client=client, id="test_session_id")
+    session = Session(client=client, id="test_session_id")
     result = await session.get_task_result("test_task_id")
 
     assert result.result == "test_result" if result else ""
@@ -63,7 +64,7 @@ async def test_session_get_task_result(client: mock.AsyncMock) -> None:
 
 @pytest.mark.asyncio
 async def test_service_collection_register(client: mock.AsyncMock) -> None:
-    coll = ServiceCollection.instance(client=client, items={})
+    coll = ServiceCollection(client=client, items={})
     service = ServiceDefinition(service_name="test_service", description="some service")
     await coll.register(service)
 
@@ -82,9 +83,9 @@ async def test_service_collection_register(client: mock.AsyncMock) -> None:
 
 @pytest.mark.asyncio
 async def test_service_collection_deregister(client: mock.AsyncMock) -> None:
-    coll = ServiceCollection.instance(
+    coll = ServiceCollection(
         client=client,
-        items={"test_service": Service.instance(client=client, id="test_service")},
+        items={"test_service": Service(client=client, id="test_service")},
     )
     await coll.deregister("test_service")
 
@@ -101,7 +102,7 @@ async def test_core_services(client: mock.AsyncMock) -> None:
         json=lambda: {"test_service": {"name": "test_service"}}
     )
 
-    core = Core.instance(client=client, id="core")
+    core = Core(client=client, id="core")
     services = await core.services.list()
 
     client.request.assert_awaited_with("GET", "http://localhost:8000/services")
@@ -112,7 +113,7 @@ async def test_core_services(client: mock.AsyncMock) -> None:
 async def test_session_collection_create(client: mock.AsyncMock) -> None:
     client.request.return_value = mock.MagicMock(json=lambda: "test_session_id")
 
-    coll = SessionCollection.instance(client=client, items={})
+    coll = SessionCollection(client=client, items={})
     session = await coll.create()
 
     client.request.assert_awaited_with("POST", "http://localhost:8000/sessions/create")
@@ -122,7 +123,7 @@ async def test_session_collection_create(client: mock.AsyncMock) -> None:
 
 @pytest.mark.asyncio
 async def test_session_collection_get_existing(client: mock.AsyncMock) -> None:
-    coll = SessionCollection.instance(client=client, items={})
+    coll = SessionCollection(client=client, items={})
     session = await coll.get("test_session_id")
 
     client.request.assert_awaited_with(
@@ -138,7 +139,7 @@ async def test_session_collection_get_nonexistent(client: mock.AsyncMock) -> Non
         "Not Found", request=mock.MagicMock(), response=mock.MagicMock(status_code=404)
     )
 
-    coll = SessionCollection.instance(client=client, items={})
+    coll = SessionCollection(client=client, items={})
 
     with pytest.raises(httpx.HTTPStatusError, match="Not Found"):
         await coll.get("test_session_id")
@@ -148,7 +149,7 @@ async def test_session_collection_get_nonexistent(client: mock.AsyncMock) -> Non
 async def test_session_collection_get_or_create_existing(
     client: mock.AsyncMock,
 ) -> None:
-    coll = SessionCollection.instance(client=client, items={})
+    coll = SessionCollection(client=client, items={})
     session = await coll.get_or_create("test_session_id")
 
     client.request.assert_awaited_with(
@@ -171,7 +172,7 @@ async def test_session_collection_get_or_create_nonexistent(
         mock.MagicMock(json=lambda: "test_session_id"),
     ]
 
-    coll = SessionCollection.instance(client=client, items={})
+    coll = SessionCollection(client=client, items={})
     await coll.get_or_create("test_session_id")
     client.request.assert_awaited_with("POST", "http://localhost:8000/sessions/create")
 
@@ -188,14 +189,14 @@ async def test_session_collection_get_or_create_error(
         )
     ]
 
-    coll = SessionCollection.instance(client=client, items={})
+    coll = SessionCollection(client=client, items={})
     with pytest.raises(httpx.HTTPStatusError):
         await coll.get_or_create("test_session_id")
 
 
 @pytest.mark.asyncio
 async def test_session_collection_delete(client: mock.AsyncMock) -> None:
-    coll = SessionCollection.instance(client=client, items={})
+    coll = SessionCollection(client=client, items={})
     await coll.delete("test_session_id")
 
     client.request.assert_awaited_with(
@@ -209,7 +210,7 @@ async def test_core_sessions(client: mock.AsyncMock) -> None:
         json=lambda: {"test_session": {"id": "test_session"}}
     )
 
-    core = Core.instance(client=client, id="core")
+    core = Core(client=client, id="core")
     sessions = await core.sessions.list()
 
     client.request.assert_awaited_with("GET", "http://localhost:8000/sessions")
@@ -233,7 +234,7 @@ async def test_session_get_tasks(client: mock.AsyncMock) -> None:
         ]
     )
 
-    session = Session.instance(client=client, id="test_session_id")
+    session = Session(client=client, id="test_session_id")
     tasks = await session.get_tasks()
 
     client.request.assert_awaited_with(
@@ -247,3 +248,37 @@ async def test_session_get_tasks(client: mock.AsyncMock) -> None:
     assert tasks[1].input == "task2 input"
     assert tasks[1].agent_id == "agent2"
     assert tasks[1].session_id == "test_session_id"
+
+
+@pytest.mark.asyncio
+async def test_session_send_event(client: mock.AsyncMock) -> None:
+    event = Event(event_type="test_event", payload={"key": "value"})
+    session = Session(client=client, id="test_session_id")
+
+    await session.send_event("test_service", "test_task_id", event)
+
+    client.request.assert_awaited_once_with(
+        "POST",
+        "http://localhost:8000/sessions/test_session_id/tasks/test_task_id/send_event",
+        json={"event_obj_str": mock.ANY, "agent_id": "test_service"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_run_nowait(client: mock.AsyncMock) -> None:
+    client.request.return_value = mock.MagicMock(json=lambda: "test_task_id")
+
+    session = Session(client=client, id="test_session_id")
+    task_id = await session.run_nowait("test_service", test_param="test_value")
+
+    assert task_id == "test_task_id"
+    client.request.assert_awaited_once_with(
+        "POST",
+        "http://localhost:8000/sessions/test_session_id/tasks",
+        json={
+            "input": '{"test_param": "test_value"}',
+            "agent_id": "test_service",
+            "session_id": "test_session_id",
+            "task_id": mock.ANY,
+        },
+    )
